@@ -1,246 +1,287 @@
 """
-PyProxyPool 主入口 - 优化版
-优化点：批量DB操作、采样健康检查、智能调度、API触发采集
+PyProxyPool 主入口 — FastAPI 版本
+
+替换原 http.server + 多进程架构，改为 FastAPI + uvicorn
+保留 SIGHUP 信号处理，Dashboard 不中断
 """
-import os
+import asyncio
+import json
+import logging
+import signal
 import sys
 import time
-import signal
-import logging
-import argparse
-from multiprocessing import Process, Queue, Value
+from contextlib import asynccontextmanager
+from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from sqlalchemy import func, select
 
-from config import (
-    API_HOST, API_PORT, MIN_PROXY_NUM, CRAWL_INTERVAL,
-    CHECK_INTERVAL, VALIDATOR_CONCURRENCY, MIN_SCORE,
-    LOG_LEVEL, LOG_FORMAT, LOG_FILE
-)
+from database import init_db, dispose_db, get_db, get_db_session
+from config import get_settings, reload_settings, settings
+from api.auth import verify_token
+from api.routes import router, compat_router, admin_router
+from api.scheduler import start_scheduler, stop_scheduler
+from api.dashboard import DASHBOARD_HTML
 
+
+# ---- Startup Helpers ----
+
+logger = logging.getLogger(__name__)
+
+
+async def _clean_stale_running_tasks():
+    """服务启动时清理残留的 running 任务（重启后无人认领的）"""
+    logger.info('检查残留任务...')
+    try:
+        session = await get_db_session()
+        from models import ScanTask
+        stmt = select(ScanTask).where(ScanTask.status == 'running')
+        result = await session.execute(stmt)
+        stale_tasks = result.scalars().all()
+        if stale_tasks:
+            from sqlalchemy import update as sa_update
+            for t in stale_tasks:
+                logger.warning(f'清理残留运行中任务: {t.task_id} (创建时间: {t.created_at})')
+                upd = sa_update(ScanTask).where(ScanTask.id == t.id).values(
+                    status='failed',
+                    invalid=t.invalid + 1 if t.invalid else 1,
+                )
+                await session.execute(upd)
+            await session.commit()
+            logger.info(f'已清理 {len(stale_tasks)} 个残留任务')
+        else:
+            logger.info('无残留任务，一切正常')
+        await session.close()
+    except Exception as e:
+        logger.error(f'清理残留任务时出错: {e}')
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+
+# ---- Logging Setup ----
 
 def setup_logging():
-    """配置日志"""
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    """配置日志（兼容原 config 设置）"""
+    os.makedirs(os.path.dirname(settings.LOG_FILE), exist_ok=True)
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    for handler in root_logger.handlers[:]:
+        handler.close()
+        root_logger.removeHandler(handler)
 
-    formatter = logging.Formatter(LOG_FORMAT)
+    console_level = getattr(logging, settings.LOG_LEVEL_CONSOLE, logging.DEBUG)
+    file_level = getattr(logging, settings.LOG_LEVEL_FILE, logging.INFO)
+    root_logger.setLevel(min(console_level, file_level))
+
+    formatter = logging.Formatter(settings.LOG_FORMAT)
 
     console = logging.StreamHandler()
+    console.setLevel(console_level)
     console.setFormatter(formatter)
     root_logger.addHandler(console)
 
-    file_handler = logging.FileHandler(LOG_FILE, encoding='utf-8')
+    if settings.LOG_ROTATE_BY_SIZE:
+        from logging.handlers import RotatingFileHandler
+        file_handler = RotatingFileHandler(
+            settings.LOG_FILE, maxBytes=settings.LOG_MAX_BYTES,
+            backupCount=settings.LOG_BACKUP_COUNT, encoding='utf-8'
+        )
+    else:
+        from logging.handlers import TimedRotatingFileHandler
+        file_handler = TimedRotatingFileHandler(
+            settings.LOG_FILE, when=settings.LOG_ROTATE_WHEN, interval=1,
+            backupCount=settings.LOG_BACKUP_COUNT, encoding='utf-8'
+        )
+    file_handler.setLevel(file_level)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
 
-logger = logging.getLogger('main')
+import os
+os.makedirs(os.path.dirname(settings.LOG_FILE), exist_ok=True)
+setup_logging()
+logger = logging.getLogger(__name__)
 
+# ---- Startup / Shutdown ----
 
-def run_api_server():
-    """API 服务进程"""
-    from api import start_api_server
-    start_api_server()
-
-
-def run_scheduler():
-    """调度器进程 - 优化版：批量操作 + 采样检查"""
-    from db import get_db
-    from getter import ProxyCrawler
-    from validator import ProxyValidator
-    from api import _crawl_event
-
-    db = get_db()
-    db.init_db()
-    crawler = ProxyCrawler()
-    validator = ProxyValidator()
-
-    stats = db.get_stats()
-    logger.info(f'Scheduler started. DB: {stats["total"]} proxies')
-
-    def do_crawl_and_validate():
-        """执行一轮采集+验证（批量操作优化）"""
-        from utils import enrich_proxies
-
-        logger.info('=== Starting crawl cycle ===')
-
-        # 1. 采集
-        crawled = crawler.crawl_all()
-        logger.info(f'Crawled {len(crawled)} proxies from sources')
-
-        if crawled:
-            # 1.5 查询 IP 地理位置
-            try:
-                enrich_proxies(crawled)
-                logger.info(f'Enriched {len(crawled)} proxies with geo data')
-            except Exception as e:
-                logger.warning(f'Geo enrichment failed: {e}')
-
-            # 2. 批量入库（单事务）
-            inserted = db.batch_insert(crawled)
-            logger.info(f'Inserted {inserted} proxies to DB')
-
-        # 3. 分批验证
-        all_proxies = db.get_all()
-        logger.info(f'Validating {len(all_proxies)} proxies...')
-
-        batch_size = VALIDATOR_CONCURRENCY
-        total_valid = 0
-        all_score_updates = []
-        all_speed_updates = []
-
-        for i in range(0, len(all_proxies), batch_size):
-            batch = all_proxies[i:i + batch_size]
-            valid, invalid, score_updates, speed_updates = validator.validate_batch(
-                batch, max_workers=min(batch_size, 50)
-            )
-            total_valid += len(valid)
-            all_score_updates.extend(score_updates)
-            all_speed_updates.extend(speed_updates)
-
-        # 4. 批量更新数据库（单事务）
-        if all_score_updates:
-            db.batch_update_score(all_score_updates)
-        if all_speed_updates:
-            db.batch_update_speed(all_speed_updates)
-
-        # 5. 清除低分代理
-        deleted = db.delete_by_score(MIN_SCORE)
-
-        final_stats = db.get_stats()
-        logger.info(
-            f'=== Cycle done. Valid: {total_valid}, Cleaned: {deleted}, '
-            f'Total: {final_stats["total"]}, AvgScore: {final_stats["avg_score"]} ==='
-        )
-
-    def do_health_check():
-        """采样健康检查 - 只验证 30% 的代理，减少开销"""
-        logger.info('=== Starting sample health check ===')
-        all_proxies = db.get_all()
-
-        if not all_proxies:
-            logger.info('No proxies to check')
-            return
-
-        # 采样验证
-        score_updates, speed_updates = validator.validate_sample(
-            all_proxies,
-            sample_ratio=0.3,
-            max_workers=min(VALIDATOR_CONCURRENCY, 50)
-        )
-
-        # 批量更新
-        if score_updates:
-            db.batch_update_score(score_updates)
-        if speed_updates:
-            db.batch_update_speed(speed_updates)
-
-        # 清除低分
-        deleted = db.delete_by_score(MIN_SCORE)
-
-        final_stats = db.get_stats()
-        logger.info(
-            f'=== Health check done. Updated: {len(score_updates)}, '
-            f'Cleaned: {deleted}, Total: {final_stats["total"]} ==='
-        )
-
-    # 主循环
-    last_crawl_time = 0
-    last_check_time = 0
-
-    while True:
-        now = time.time()
-        current_count = db.count()
-
-        # 检查 API 触发
-        api_triggered = _crawl_event.is_set()
-        if api_triggered:
-            _crawl_event.clear()
-            logger.info('Crawl triggered by API request')
-
-        # 采集条件：API触发 / 数量不足 / 到时间
-        if api_triggered or current_count < MIN_PROXY_NUM or (now - last_crawl_time) >= CRAWL_INTERVAL:
-            try:
-                do_crawl_and_validate()
-                last_crawl_time = time.time()
-            except Exception as e:
-                logger.error(f'Crawl cycle failed: {e}', exc_info=True)
-                time.sleep(60)
-                continue
-
-        # 健康检查条件：到时间
-        elif (now - last_check_time) >= CHECK_INTERVAL:
-            try:
-                do_health_check()
-                last_check_time = time.time()
-            except Exception as e:
-                logger.error(f'Health check failed: {e}', exc_info=True)
-
-        # 等待下一轮（支持 API 触发中断）
-        sleep_time = min(
-            CRAWL_INTERVAL - (time.time() - last_crawl_time),
-            CHECK_INTERVAL - (time.time() - last_check_time),
-            60
-        )
-        sleep_time = max(sleep_time, 5)
-        logger.info(f'Sleeping {sleep_time:.0f}s. Proxies in DB: {db.count()}')
-
-        for _ in range(int(sleep_time)):
-            if _crawl_event.is_set():
-                break
-            time.sleep(1)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='PyProxyPool - Python代理池')
-    parser.add_argument('--api-only', action='store_true', help='只启动API服务')
-    parser.add_argument('--scheduler-only', action='store_true', help='只启动调度器')
-    parser.add_argument('--port', type=int, default=API_PORT, help='API端口')
-    args = parser.parse_args()
-
-    setup_logging()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    应用生命周期管理
+    启动：初始化数据库 + 启动调度器
+    关闭：停止调度器 + 释放连接
+    """
     logger.info('='*50)
-    logger.info('PyProxyPool starting...')
-    logger.info(f'API: http://{API_HOST}:{args.port}')
+    logger.info('PyProxyPool v3.0.0 starting...')
+    logger.info(f'API: http://{settings.API_HOST}:{settings.API_PORT}')
     logger.info('='*50)
 
-    processes = []
+    # 初始化数据库
+    await init_db()
 
-    if args.api_only:
-        run_api_server()
-        return
+    # 初始化 GeoIP 数据库
+    from database import init_geoip
+    init_geoip()
 
-    if args.scheduler_only:
-        run_scheduler()
-        return
+    # 清理上次启动时残留的 running 任务
+    _clean_stale_running_tasks()
 
-    p_api = Process(target=run_api_server, name='api-server', daemon=True)
-    p_api.start()
-    processes.append(p_api)
-    logger.info(f'API server process started (PID: {p_api.pid})')
+    # 启动调度器
+    await start_scheduler()
 
-    p_scheduler = Process(target=run_scheduler, name='scheduler', daemon=True)
-    p_scheduler.start()
-    processes.append(p_scheduler)
-    logger.info(f'Scheduler process started (PID: {p_scheduler.pid})')
+    yield
 
-    def shutdown(sig, frame):
-        logger.info('Shutting down...')
-        for p in processes:
-            p.terminate()
-            p.join(timeout=5)
-        sys.exit(0)
+    # 关闭
+    await stop_scheduler()
+    await dispose_db()
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    logger.info('PyProxyPool shutdown complete')
+
+
+# ---- FastAPI App ----
+
+app = FastAPI(
+    title='PyProxyPool',
+    version='3.0.0',
+    description='Proxy Intelligence System',
+    lifespan=lifespan,
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['*'],
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
+
+# Register routes
+app.include_router(router)
+app.include_router(compat_router)
+
+# 管理 API（GeoIP）
+app.include_router(admin_router)
+
+# ---- Dashboard (保留 HTML 字符串) ----
+
+@app.get('/', response_class=HTMLResponse)
+@app.get('/dashboard', response_class=HTMLResponse)
+async def dashboard():
+    """返回 Dashboard HTML 页面"""
+    return DASHBOARD_HTML
+
+
+# ---- 日志查看（供 Dashboard 使用） ----
+
+@app.get('/logs')
+async def get_logs(lines: int = Query(50, ge=1, le=200)):
+    """返回最近的日志行"""
+    log_file = settings.LOG_FILE
+    try:
+        if os.path.isfile(log_file):
+            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                all_lines = f.readlines()
+            return ''.join(all_lines[-lines:])
+    except Exception as e:
+        return f'读取日志失败: {e}'
+    return '暂无日志'
+
+
+# ---- WebSocket ----
+
+_ws_clients = set()
+
+@app.websocket('/ws')
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket 端点 — 保留原有逻辑"""
+    await websocket.accept()
+    _ws_clients.add(websocket)
+    logger.info(f'WebSocket connected: {len(_ws_clients)} clients')
 
     try:
-        for p in processes:
-            p.join()
-    except KeyboardInterrupt:
-        shutdown(None, None)
+        while True:
+            # 接收消息（可选）
+            data = await websocket.receive_text()
+            logger.debug(f'WS message: {data}')
+
+            # 回显（简单实现，保持连接活跃）
+            await websocket.send_text(json.dumps({
+                'type': 'ping',
+                'timestamp': datetime.utcnow().isoformat(),
+            }))
+    except WebSocketDisconnect:
+        _ws_clients.discard(websocket)
+        logger.info(f'WebSocket disconnected: {len(_ws_clients)} clients')
+    except Exception as e:
+        logger.error(f'WebSocket error: {e}')
+        _ws_clients.discard(websocket)
+
+
+# ---- Signal Handlers ----
+
+async def _handle_sighup(signum, frame):
+    """SIGHUP — 热重载配置"""
+    logger.info('SIGHUP received, reloading config...')
+    try:
+        reload_settings()
+        setup_logging()
+        logger.info('Config reloaded via SIGHUP')
+    except Exception as e:
+        logger.error(f'Config reload failed: {e}')
+
+
+# ---- CLI Entry ----
+
+def main():
+    """命令行入口"""
+    import argparse
+    parser = argparse.ArgumentParser(description='PyProxyPool v3.0.0 - Proxy Intelligence System')
+    parser.add_argument('--api-only', action='store_true', help='只启动API服务')
+    parser.add_argument('--port', type=int, default=None, help='API端口')
+    args = parser.parse_args()
+
+    if args.port:
+        settings.API_PORT = args.port
+
+    if args.api_only:
+        # 只启动 API（不调度器）
+        @asynccontextmanager
+        async def api_only_lifespan(app):
+            await init_db()
+            yield
+            await dispose_db()
+
+        api_app = FastAPI(lifespan=api_only_lifespan)
+        api_app.include_router(router)
+        api_app.include_router(compat_router)
+        api_app.add_middleware(
+            CORSMiddleware, allow_origins=['*'], allow_methods=['*'],
+            allow_headers=['*'], allow_credentials=True,
+        )
+
+        @api_app.get('/', response_class=HTMLResponse)
+        async def _dashboard():
+            return DASHBOARD_HTML
+
+        uvicorn.run(
+            api_app,
+            host=settings.API_HOST,
+            port=settings.API_PORT,
+            log_level='info',
+        )
+    else:
+        # 完整模式（API + 调度器）
+        uvicorn.run(
+            app,
+            host=settings.API_HOST,
+            port=settings.API_PORT,
+            log_level='info',
+        )
 
 
 if __name__ == '__main__':

@@ -1,0 +1,104 @@
+%% Startup Flow
+sequenceDiagram
+    participant CLI as main.py
+    participant Config as config.py
+    participant DB as database.py
+    participant FastAPI as FastAPI App
+    participant Scheduler as scheduler.py
+    participant Redis as Redis
+
+    CLI->>Config: Load Pydantic Settings
+    Config-->>CLI: settings instance
+    CLI->>DB: create_async_engine(DSN)
+    DB-->>CLI: async_engine
+    CLI->>DB: make_session_factory(engine)
+    DB-->>CLI: session_factory
+    CLI->>Redis: create_redis_pool()
+    Redis-->>CLI: redis_pool
+    CLI->>FastAPI: app = FastAPI()
+    FastAPI-->>CLI: FastAPI instance
+    CLI->>FastAPI: register auth middleware
+    CLI->>FastAPI: register routes
+    CLI->>FastAPI: on_event startup
+    FastAPI->>DB: init_tables()
+    FastAPI->>Scheduler: start_scheduler()
+    Scheduler->>Scheduler: start APScheduler
+    CLI->>FastAPI: uvicorn.run()
+
+%% Crawl Flow (Async)
+sequenceDiagram
+    participant API as routes.py
+    participant Scheduler as scheduler.py
+    participant Importer as importer.py
+    participant Crawler as proxy_crawler.py
+    participant Scanner as scanner.py
+    participant Scoring as scoring.py
+    participant Pool as pool.py
+    participant DB as database.py
+    participant Task as ScanTask
+
+    API->>Scheduler: POST /api/v1/crawl
+    Scheduler->>Task: create ScanTask(crawl)
+    Scheduler->>Crawler: crawl_all() [async]
+    Crawler-->>Scheduler: raw_proxy_list
+    Scheduler->>Importer: import_proxies(raw_list)
+    Importer->>Importer: parse + dedup
+    Importer->>DB: batch_insert(proxies)
+    DB-->>Importer: count
+    Scheduler->>Scanner: validate_batch(proxies, semaphore) [async]
+    Scanner->>Scanner: for proxy in semaphored_batch: validate_one()
+    Scanner->>Task: update result per proxy
+    Scanner-->>Scheduler: validation_results
+    Scheduler->>Scoring: calculate(proxy) for each
+    Scoring-->>Scheduler: new_scan_score, new_grade
+    Scheduler->>Pool: update_pool(session, scored_proxies)
+    Pool->>DB: bulk_update (scan_score, grade)
+    Scheduler->>Task: complete(task_id)
+    Task-->>Scheduler: final stats
+    Scheduler-->>API: {status: "completed", ...}
+
+%% Health Check Flow
+sequenceDiagram
+    participant Scheduler as scheduler.py
+    participant Pool as pool.py
+    participant Scanner as scanner.py
+    participant Scoring as scoring.py
+    participant Task as ScanTask
+    participant DB as database.py
+
+    Scheduler->>Pool: get_all_active_proxies(session)
+    Pool-->>Scheduler: proxy_list (sample 30%)
+    Scheduler->>Task: create ScanTask(health_check)
+    Scheduler->>Scanner: validate_batch(sample_proxies, semaphore)
+    Scanner->>Scanner: validate_one() [async, semaphore]
+    Scanner-->>Scheduler: results
+    Scheduler->>Scoring: recalculate_score(proxy)
+    Scoring-->>Scheduler: new_scan_score, new_grade
+    Scheduler->>Pool: update_pool(session, updated_proxies)
+    Pool->>DB: bulk_update (score, scan_score, grade, speed)
+    Pool->>DB: delete_expired(min_grade='D')
+    Scheduler->>Task: complete(task_id)
+
+%% API Query Flow
+sequenceDiagram
+    participant Client as Client
+    participant Auth as auth.py
+    participant Routes as routes.py
+    participant ProxySvc as ProxyService
+    participant Cache as Redis Cache
+    participant DB as PostgreSQL
+
+    Client->>Auth: GET /api/v1/proxies (X-API-Key)
+    Auth->>Auth: verify_token(key)
+    Auth-->>Routes: authenticated request
+    Routes->>Cache: get_cached("proxies:filtered")
+    alt cache hit
+        Cache-->>Routes: cached data
+    else cache miss
+        Routes->>ProxySvc: list_proxies(session, filters)
+        ProxySvc->>DB: SELECT ... WHERE grade IN (...) ORDER BY scan_score DESC LIMIT/OFFSET
+        DB-->>ProxySvc: proxy_list
+        ProxySvc-->>Routes: paginated_result
+        Routes->>Cache: set_cached(data, ttl=60s)
+    end
+    Routes-->>Client: JSON response

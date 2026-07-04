@@ -1,0 +1,119 @@
+classDiagram
+    class Proxy {
+        +str ip
+        +int port
+        +str protocol
+        +str username
+        +str password
+        +str anonymity
+        +str country
+        +str area
+        +float speed
+        +int score
+        +str source
+        +datetime last_verified
+        +int use_count
+        +str tags
+        +datetime created_at
+        +int purity_score
+        +str purity_class
+        +bool is_datacenter
+        +bool is_proxy
+        +bool is_vpn
+        +bool is_tor
+        +int abuse_confidence
+        +str isp
+        +str asn
+        +str asn_owner
+        +str org_name
+        +str ip_type
+        +bool is_native
+        +str shared_users
+        +int risk_score
+        +str risk_level
+        +str rdns
+        +str scenes
+        +str ping0_location
+        +float ping0_latitude
+        +float ping0_longitude
+        +str grade
+        +float scan_score
+        +float survival_rate
+        +float latency_score
+        +float ip_type_score
+        +float risk_dimension_score
+    }
+
+    class ScanTask {
+        +int id
+        +str task_type
+        +str status
+        +int total_proxies
+        +int processed_count
+        +int success_count
+        +int failed_count
+        +float throughput
+        +datetime started_at
+        +datetime completed_at
+        +str error_message
+        +str parameters
+    }
+
+    class ScanResult {
+        +int id
+        +int task_id
+        +str proxy_ip
+        +int proxy_port
+        +str result_type
+        +str result_message
+        +float speed_ms
+        +str detected_ip
+        +datetime created_at
+    }
+
+    class WhitelistEntry {
+        +str ip
+        +int port
+        +str protocol
+        +datetime created_at
+    }
+
+    class BlacklistEntry {
+        +str ip
+        +int port
+        +str protocol
+        +datetime created_at
+    }
+
+    class ScoringEngine {
+        +calculate(proxy: Proxy) float
+        +_score_survival(proxy: Proxy) float
+        +_score_latency(proxy: Proxy) float
+        +_score_ip_type(proxy: Proxy) float
+        +_score_risk(proxy: Proxy) float
+        +grade_from_score(score: float) str
+        +WEIGHTS: dict
+    }
+
+    class ProxyService {
+        +list_proxies(session, filters) List[Proxy]
+        +get_proxy(session, ip, port) Proxy
+        +delete_proxy(session, ip, port) bool
+        +get_stats(session) dict
+    }
+
+    class ScannerService {
+        +validate_batch(session, proxies, semaphore) dict
+        +validate_one(proxy, semaphore) ScanResult
+    }
+
+    class ImporterService {
+        +import_proxies(session, raw_list) int
+        +parse_proxy(raw: str) Optional[Proxy]
+    }
+
+    ScanTask "1" -- "0..*" ScanResult : contains
+    ScannerService ..> ScanTask : creates
+    ScannerService ..> ScanResult : creates
+    ProxyService ..> Proxy : manages
+    ScoringEngine ..> Proxy : scores

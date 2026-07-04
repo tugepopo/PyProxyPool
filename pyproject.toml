@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proxypool"
+version = "3.0.0"
+description = "Proxy Intelligence System - Async Proxy Pool with Scoring & Grading"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "PyProxyPool Contributors"},
+]
+
+dependencies = [
+    # Web framework
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+
+    # Data validation
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+
+    # Database
+    "sqlalchemy[asyncio]>=2.0.23",
+    "asyncpg>=0.29.0",
+    "aiosqlite>=0.19.0",  # SQLite 异步驱动
+    "alembic>=1.13.0",
+    "psycopg2-binary>=2.9.0",  # Alembic 同步迁移需要 psycopg2
+
+    # Async HTTP
+    "aiohttp>=3.9.0",
+
+    # Cache
+    "redis[hiredis]>=5.0.0",
+
+    # Scheduler
+    "apscheduler>=3.10.4",
+
+    # HTML parsing
+    "lxml>=4.9.0",
+    "beautifulsoup4>=4.12.0",
+
+    # Legacy compatibility
+    "requests[socks]>=2.28.0",
+
+    # GeoIP
+    "geoip2>=4.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.25.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+proxypool = "main:main"
+
+[tool.setuptools.packages.find]
+include = ["*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
